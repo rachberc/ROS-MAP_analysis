@@ -1,0 +1,296 @@
+---
+title: "isolated_HGS_ROSMAP_models"
+author: "Rachel Bercovitch"
+date: "4/23/2023"
+output: html_document
+---
+
+## LOAD PACKAGES
+```{r include=FALSE}
+library(Hmisc)
+library(dplyr)
+library(corrplot)
+library(tidyr)
+library(tidyverse)
+library(reshape2)
+library(ggplot2)
+library(cowplot)
+library(plyr)
+library(magrittr)
+library(lme4)
+library(lmerTest)
+library(rms)
+library(mediation)
+library(tibble)
+library(readxl)
+library(readr)  
+library(gtools)
+```
+
+## LOAD DATA
+```{r}
+rosmap_path<-'/external/rprshnas01/netdata_kcni/dflab/team/rb/ROSMAP/' # file path on SCC
+
+# cross-sectional
+
+ROSMAP_cross <- read.csv(file.path(rosmap_path,'ROSMAP_basic_04-21-2023_noDup.csv'))
+ROSMAP_cross <- ROSMAP_cross[,c("projid", "age_bl", "msex", "educ", "age_first_ad_dx", "age_death")]
+
+# longitudinal
+
+long_xl <- read_excel(file.path(rosmap_path,'dataset_978_long_04-21-2023.xlsx'))
+write_csv(long_xl, file="/external/rprshnas01/netdata_kcni/dflab/team/rb/ROSMAP/ROSMAP_long_04-21-2023.csv")
+ROSMAP_long <- read.csv(file.path(rosmap_path,'ROSMAP_long_04-21-2023.csv'))
+ROSMAP_long <- ROSMAP_long[,c("projid", "vasc_risks_sum", "phys5itemsum", "fu_year", "mot_grip", "d_frailty", "dcfdx", "age_at_visit", "bmi", "cogn_global")]
+
+# post-mortem
+
+post <- readRDS("/external/rprshnas01/external_data/rosmap/metadata/ROSmaster.rds")
+ROSMAP_post <- post[,c("projid", "amyloid", "tangles", "nft", "pmi", "cogdx", "plaq_n", "plaq_d", "tdp_stage4", "cvda", "arteriol_scler", "cvda_4gp2", "ci_num2_gct", "ci_num2_mct", "caa_4gp", "dlbdx")]
+
+```
+
+## FORMAT LONGITUDINAL DATA
+```{r}
+## Participant subset to calculate cognitive slopes for in longitudinal analysis
+
+ID_subset <- names(table(ROSMAP_long$projid)>1) # subset the data upstream to people who have >2 visits 
+pl <- subset(ROSMAP_long, projid %in% ID_subset)
+
+## Get average score for physical activity, vascular risk, and BMI
+
+mean_obs <- lapply(unique(pl$projid),function(i) {
+  
+  data_sub <- subset(pl, projid==i) # subset pl dataset to each person (i) one by one
+  data_sub$phys_mean <- mean(data_sub[,"phys5itemsum"], na.rm=T) # average over all visits
+  data_sub$vasc_mean <- mean(data_sub[,"vasc_risks_sum"], na.rm=T) # average over all visits
+  data_sub$bmi_mean <- mean(data_sub[,"bmi"], na.rm=T) # average over all visits
+  data_sub[1,c("projid","phys_mean","vasc_mean", "bmi_mean")] 
+  
+})
+
+mean_df <- as.data.frame(do.call(rbind,mean_obs)) # data frame with three avg. columns to merge into cross-sectional data and PRS data
+```
+
+## CALCULATE COGNITION SLOPE FOR EACH PARTICIPANT
+```{r}
+## Linear mixed effects model to obtain change in cognition over time for each participant
+
+longitudinal_rosmap <- readRDS("/external/rprshnas01/netdata_kcni/dflab/team/rb/rb-rosmap-plink-profile-merge/data/data-merge/data_merge_nosqldf.RDS")
+long_model3 <- lmer(cogn_global ~ age_bl + fu_year + (1 + fu_year|projid), data = longitudinal_rosmap, REML = FALSE,control = lmerControl(optimizer ="Nelder_Mead"))
+coefs <- coef(long_model3)[["projid"]]
+fu_year_coefs <- coefs[3] 
+cog_change_over_time <- tibble::rownames_to_column(fu_year_coefs, "projid") # re-introduce projid as column name
+colnames(cog_change_over_time)[2] <- "fu_year_coefs"
+```
+
+## OBTAIN CROSS-SECTIONAL COGNITION VARIABLE
+```{r}
+## Get the most recent global cognition score
+
+cognition_ROSMAP_long <- subset(ROSMAP_long, is.na(cogn_global)==FALSE)
+cog_last_visit <- cognition_ROSMAP_long %>%
+  group_by(projid) %>%
+  slice_max(order_by = age_at_visit, n = 1) # order participants by age at visit and take the max corresponding value for cognition
+cog_last_visit$cogn_global_last_visit <- cog_last_visit$cogn_global
+cog_last_visit$age_last_cogn_test <- cog_last_visit$age_at_visit
+cog_last_visit <- cog_last_visit[,c("cogn_global_last_visit", "age_last_cogn_test", "projid")]
+
+# Get the most recent grip strength measurement
+
+handstrength_ROSMAP_long <- subset(ROSMAP_long, is.na(mot_grip)==F)
+handstreng_last_visit <- handstrength_ROSMAP_long %>%
+  group_by(projid) %>%
+  slice_max(order_by = age_at_visit, n = 1) # order participants by age at visit and take the max corresponding value for grip strength
+handstreng_last_visit$handstrength_last_visit <- handstreng_last_visit$mot_grip
+handstreng_last_visit$age_last_handstrength_test <- handstreng_last_visit$age_at_visit
+handstreng_last_visit <- handstreng_last_visit[,c("handstrength_last_visit", "age_last_handstrength_test", "projid")]
+
+last_visit_df <- merge(cog_last_visit, handstreng_last_visit, by = "projid") # merge these two new variables (last global cognition and last grip strength) into one df
+```
+
+## PRS DATA
+```{r}
+## Import PRS and merge them to wide-form df
+# PRS from Jones HGS GWAS
+
+HGS_PRS <- read.table("/external/rprshnas01/netdata_kcni/dflab/team/rw/projects/rb-rosmap-pca/data/03_features/rosmap/polygenic-risk-score/hand-grip-strength/regressed_polygenic_risk_score.tsv", header = T)
+colnames(HGS_PRS)[2] <- "HGS_PRS"
+HGS_PRS$HGS_PRS <- (HGS_PRS$HGS_PRS)*(-1) # multiply by -1 to aid in interpretation (grip strength vs. grip weakness)
+colnames(HGS_PRS)[1] <- "projid"
+
+## Construct PRS-AD
+
+AD_PRS <- read.table("/external/rprshnas01/netdata_kcni/dflab/team/rw/projects/rb-rosmap-pca/data/03_features/rosmap/polygenic-risk-score/alzheimer-disease/regressed_polygenic_risk_score.tsv", header = T)
+colnames(AD_PRS)[2] <- "AD_PRS"
+colnames(AD_PRS)[1] <- "projid"
+
+PRS_df <- merge(HGS_PRS, AD_PRS, by = "projid") # merge PRS to one df
+```
+
+## MERGING ALL DATASETS
+```{r}
+ROSMAP_post$projid <- as.integer(ROSMAP_post$projid)
+cog_change_over_time$projid <- as.integer(cog_change_over_time$projid)
+df_list <- list(ROSMAP_cross, ROSMAP_post, mean_df, cog_change_over_time, PRS_df, last_visit_df)
+ROSMAP_df <- df_list %>% reduce(full_join, by = "projid")
+```
+
+## DEMOGRAPHIC INFORMATION
+```{r}
+# Stratify ROSMAP_df by sex
+
+male.df <- ROSMAP_df[which(ROSMAP_df$msex == "1"),]
+female.df <- ROSMAP_df[which(ROSMAP_df$msex == "0"),]
+summary_vars <- c("age_bl", "bmi_mean", "phys_mean", "vasc_mean", "cogdx")
+
+demo_stats <- for (i in summary_vars) {
+  
+  cat(paste0("Variable: ", i, "\n"))
+  cat("Male summary statistics:\n")
+  print(summary(male.df[[i]]))
+  
+  cat("\nFemale summary statistics:\n")
+  print(summary(female.df[[i]]))
+  
+  cat("\n")
+  
+}
+
+```
+
+## SCALE NUMERIC VARS
+```{r}
+# List of variable names to scale and convert
+
+vars_to_scale <- c("age_bl", "phys_mean", "bmi_mean", "HGS_PRS", "AD_PRS", "cogn_global_last_visit", "age_last_cogn_test","handstrength_last_visit","age_last_handstrength_test")
+
+# For loop to scale and convert to numeric
+for (i in vars_to_scale) {
+  ROSMAP_df[[i]] <- as.numeric(scale(ROSMAP_df[[i]]))
+}
+
+# square root transform brain pathology variables
+
+vars_to_transform <- c("amyloid", "tangles", "nft", "plaq_d", "plaq_n")
+
+# For loop to scale and square root transform
+
+for (i in vars_to_transform) {
+  ROSMAP_df[[i]] <- scale(sqrt(ROSMAP_df[[i]]))
+}
+
+```
+
+## VALIDATION MODELS
+```{r}
+# validate our PRS-HGS with measured hand strength
+
+validate_HGS <- lm(handstrength_last_visit~HGS_PRS, data = ROSMAP_df)
+validate_HGS.2 <- lm(handstrength_last_visit~HGS_PRS + age_last_handstrength_test, data = ROSMAP_df)
+validate_HGS.3 <- lm(handstrength_last_visit~HGS_PRS + msex, data = ROSMAP_df)
+validate_HGS_covs <- ols(handstrength_last_visit~HGS_PRS + age_last_handstrength_test + msex + educ + bmi_mean, data = ROSMAP_df)
+```
+
+## MODEL PRS-HGS WITH RESPECT TO MOST RECENT GLOBAL COGNITION SCORE
+```{r}
+CS_model_1a <- lm(cogn_global_last_visit~HGS_PRS, data = ROSMAP_df)
+CS_model_1b <- ols(cogn_global_last_visit~HGS_PRS + age_last_cogn_test + msex + phys_mean + vasc_mean + educ + bmi_mean, data = ROSMAP_df)
+CS_model_1c <- lm(cogn_global_last_visit~AD_PRS + age_last_cogn_test + msex + phys_mean + vasc_mean + educ + bmi_mean, data = ROSMAP_df)
+CS_model_1d <- lm(cogn_global_last_visit~AD_PRS + HGS_PRS + age_last_cogn_test + msex + phys_mean + vasc_mean + educ + bmi_mean, data = ROSMAP_df)
+```
+
+## LONGITUDINAL LINEAR MODELS (cognition~PRS-HGS)
+```{r}
+# hypothesis 1 
+
+model_1a.i <- lm(fu_year_coefs~HGS_PRS, data = ROSMAP_df)
+model_1a.ii <- ols(fu_year_coefs~HGS_PRS + age_bl + msex + phys_mean + vasc_mean + educ + bmi_mean, data = ROSMAP_df)
+
+# hypothesis 2
+
+model_2.1 <- lm(fu_year_coefs~AD_PRS, data = ROSMAP_df)
+model_2.2 <- lm(fu_year_coefs~AD_PRS + age_bl + msex + phys_mean + vasc_mean + bmi_mean + educ, data = ROSMAP_df)
+model_2.3 <- lm(fu_year_coefs~AD_PRS + HGS_PRS + age_bl + msex + phys_mean + vasc_mean + bmi_mean + educ, data = ROSMAP_df)
+model_2.4 <- lm(fu_year_coefs~AD_PRS * HGS_PRS + age_bl + msex + phys_mean + vasc_mean + bmi_mean + educ, data = ROSMAP_df)
+
+# p.adjust(c(mod2sum_1$coefficients[2,4], mod2sum_2$coefficients[2,4], mod2sum_3$coefficients[2,4]), method = "fdr")
+```
+
+## POST-MORTEM MODELS
+```{r}
+
+# structure of models:
+# model_pathology.1 = lm(pathology~AD_PRS + handstrength_last_visit + msex + age_death + pmi, data = ROSMAP_df)
+# model_pathology.2 = lm(amyloid~HGS_PRS + handstrength_last_visit + msex + age_death + pmi, data = ROSMAP_df)
+# model_pathology.3 = lm(amyloid~handstrength_last_visit + msex + age_death + pmi, data = ROSMAP_df)
+
+model_list <- list() # list to store the models
+
+# vector of dependent variables
+dependent_vars <- c("amyloid", "tangles", "nft", "tdp_stage4", "arteriol_scler", "cvda_4gp2", "ci_num2_gct", "ci_num2_mct", "plaq_d", "plaq_n")
+
+# vector of independent variables
+independent_vars <- c("AD_PRS", "HGS_PRS", "handstrength_last_visit", "msex", "age_death", "pmi")
+
+# Loop over the dependent variables
+for(var in dependent_vars){
+  # Loop over the independent variables
+  for(i in 1:length(independent_vars)){
+    # Create the model formula
+    formula <- paste(var, "~", paste(independent_vars[1:i], collapse = "+"))
+    # Create the model
+    model <- lm(formula, data = ROSMAP_df)
+    # Add the model to the list
+    model_list[[paste0("model_",var,".",i)]] <- model
+  }
+}
+
+```
+
+## MEDIATION ANALYSIS
+```{r}
+# mediator = physical activity
+
+phys_mediation_df <- ROSMAP_df[,c("phys_mean", "HGS_PRS", "age_last_cogn_test", "educ", "msex", "vasc_mean", "bmi_mean", "cogn_global_last_visit")]
+phys_mediation_df <- na.omit(phys_mediation_df)
+PA_rosmap_mediate_model <- lm(phys_mean~HGS_PRS + age_last_cogn_test + educ + msex + vasc_mean + bmi_mean, data = phys_mediation_df)
+summary(PA_rosmap_mediate_model)
+PA_rosmap_full_model <- lm(cogn_global_last_visit~phys_mean + HGS_PRS + age_last_cogn_test + educ + msex + vasc_mean + bmi_mean, data = phys_mediation_df)
+set.seed(2000)
+PA_rosmap_results <- mediate(PA_rosmap_mediate_model, PA_rosmap_full_model, treat = 'HGS_PRS', mediator = 'phys_mean', boot = T)
+summary(PA_rosmap_results)
+PA_plot <- plot(PA_rosmap_results)
+ggsave(file.path(rosmap_path,'PA_ROSMAP_plot.png'), plot = PA_plot, width = 8, height = 4)
+
+# mediator = hand grip strength
+
+HGS_mediation_df <- ROSMAP_df[,c("HGS_PRS", "age_last_cogn_test", "educ", "msex", "vasc_mean", "bmi_mean", "cogn_global_last_visit", "handstrength_last_visit")]
+HGS_mediation_df <- na.omit(HGS_mediation_df)
+HGS_rosmap_mediate_model <- lm(handstrength_last_visit~HGS_PRS + age_last_cogn_test + educ + msex + vasc_mean + bmi_mean, data = ROSMAP_df)
+summary(HGS_rosmap_mediate_model)
+HGS_rosmap_full_model <- lm(cogn_global_last_visit~handstrength_last_visit + HGS_PRS + age_last_cogn_test + educ + msex + vasc_mean + bmi_mean, data = HGS_mediation_df)
+set.seed(2000)
+HGS_rosmap_results <- mediate(HGS_rosmap_mediate_model, HGS_rosmap_full_model, treat = 'HGS_PRS', mediator = 'handstrength_last_visit', boot = T)
+summary(HGS_rosmap_results)
+HGS_plot <- plot(HGS_rosmap_results)
+ggsave(file.path(rosmap_path,'HGS_ROSMAP_plot.png'), plot = HGS_plot, width = 8, height = 4)
+```
+
+## PLOT COGNITIVE DECLINE BY TERTILES
+```{r include=FALSE}
+rm2 <- subset(longitudinal_rosmap, is.na(cogn_global)==F & is.na(fu_year)==F)
+modnew <- lmer(cogn_global ~ age_bl + fu_year + (1 + fu_year|projid), data = rm2, REML = FALSE,control = lmerControl(optimizer ="Nelder_Mead"))
+rm2$predicted <- predict(modnew)
+rm3 <- rm2
+rm3 <- merge(rm3,HGS_PRS,by="projid")
+rm2 <- merge(rm2,HGS_PRS,by="projid")
+rm2$prs3 <- quantcut(rm2$HGS_PRS,3)
+PRS_tertiles <- ggplot(rm2,aes(y=cogn_global,x=fu_year,group=projid))+
+  geom_smooth(aes(y=predicted, fill=as.factor(prs3), group=prs3), method="lm")+
+  scale_fill_manual(values=c( "red", "#9966CC",  "green"))+
+  theme_minimal() +
+  labs(x = "Time (years)", y = "Cognition", fill = "PRS-HGS")
+
+ggsave(file.path(rosmap_path,'PRS_tertiles_plot.png'), plot = PRS_tertiles, width = 8, height = 6)
+```
